@@ -64,14 +64,11 @@ except ModuleNotFoundError:
 def patch_streamlit_drawable_canvas_image_helper() -> Optional[str]:
     """Patch a Streamlit compatibility issue used by streamlit-drawable-canvas.
 
-    Problem:
     Newer Streamlit versions moved `image_to_url` from
     `streamlit.elements.image` to `streamlit.elements.lib.image_utils`.
-    The streamlit-drawable-canvas package still calls the old location, which
-    causes an AttributeError when a background image is passed to st_canvas.
+    The streamlit-drawable-canvas package may still call the old location.
 
-    Returns:
-        None if patched/already compatible, otherwise a short warning message.
+    Returns None if everything is okay. Returns a warning string if patching fails.
     """
     try:
         old_image_module = importlib.import_module("streamlit.elements.image")
@@ -83,10 +80,10 @@ def patch_streamlit_drawable_canvas_image_helper() -> Optional[str]:
         if not hasattr(image_utils, "image_to_url"):
             return "Streamlit image helper was not found in the expected compatibility location."
 
-        old_image_module.image_to_url = image_utils.image_to_url  # type: ignore[attr-defined]
+        setattr(old_image_module, "image_to_url", image_utils.image_to_url)
         return None
     except Exception as exc:
-        return f"
+        return f"Canvas compatibility patch could not be applied: {exc}"
 
 
 # ======================================================
@@ -633,7 +630,7 @@ class TraceTakeoffTests(unittest.TestCase):
 
     def test_canvas_compatibility_patch_does_not_crash(self) -> None:
         warning = patch_streamlit_drawable_canvas_image_helper()
-        self.assertTrue(warning is None or isinstance(warning
+        self.assertTrue(warning is None or isinstance(warning, str))
 
 
 def run_tests() -> None:
@@ -983,5 +980,6 @@ if __name__ == "__main__":
         run_tests()
     else:
         run_app()
+
 
 
