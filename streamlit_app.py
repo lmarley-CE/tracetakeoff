@@ -61,6 +61,34 @@ except ModuleNotFoundError:
     st_canvas = None  # type: ignore
 
 
+def patch_streamlit_drawable_canvas_image_helper() -> Optional[str]:
+    """Patch a Streamlit compatibility issue used by streamlit-drawable-canvas.
+
+    Problem:
+    Newer Streamlit versions moved `image_to_url` from
+    `streamlit.elements.image` to `streamlit.elements.lib.image_utils`.
+    The streamlit-drawable-canvas package still calls the old location, which
+    causes an AttributeError when a background image is passed to st_canvas.
+
+    Returns:
+        None if patched/already compatible, otherwise a short warning message.
+    """
+    try:
+        old_image_module = importlib.import_module("streamlit.elements.image")
+
+        if hasattr(old_image_module, "image_to_url"):
+            return None
+
+        image_utils = importlib.import_module("streamlit.elements.lib.image_utils")
+        if not hasattr(image_utils, "image_to_url"):
+            return "Streamlit image helper was not found in the expected compatibility location."
+
+        old_image_module.image_to_url = image_utils.image_to_url  # type: ignore[attr-defined]
+        return None
+    except Exception as exc:
+        return f"
+
+
 # ======================================================
 # Data Models
 # ======================================================
@@ -278,21 +306,30 @@ def build_instruction_notes(instruction: EstimatorInstruction) -> str:
 
 
 def get_pymupdf() -> Tuple[Optional[Any], Optional[str]]:
-    """Return PyMuPDF if installed correctly, otherwise return a useful error."""
-    try:
-        pymupdf = importlib.import_module("pymupdf")
-        if hasattr(pymupdf, "open") and hasattr(pymupdf, "Matrix"):
-            return pymupdf, None
-        return None, "The installed `pymupdf` package does not look like PyMuPDF."
-    except ModuleNotFoundError as exc:
-        if exc.name == "pymupdf":
-            return None, (
-                "PyMuPDF is not installed. Add `PyMuPDF` to requirements.txt, commit it, "
-                "and reboot the Streamlit app. Do not install the package named `fitz`."
-            )
-        return None, f"PyMuPDF import failed because another module is missing: {exc.name}"
-    except Exception as exc:
-        return None, f"PyMuPDF could not be imported. Details: {exc}"
+    """Return PyMuPDF if installed correctly, otherwise return a useful error.
+
+    Streamlit Cloud may expose PyMuPDF as either `pymupdf` or `fitz`
+    depending on package version. We try `pymupdf` first, then carefully
+    try `fitz` only if it looks like the real PyMuPDF package.
+    """
+    import_errors: List[str] = []
+
+    for module_name in ("pymupdf", "fitz"):
+        try:
+            module = importlib.import_module(module_name)
+            if hasattr(module, "open") and hasattr(module, "Matrix") and hasattr(module, "Document"):
+                return module, None
+            import_errors.append(f"`{module_name}` imported, but it does not look like PyMuPDF.")
+        except ModuleNotFoundError as exc:
+            import_errors.append(f"`{module_name}` missing: {exc.name}")
+        except Exception as exc:
+            import_errors.append(f"`{module_name}` failed: {exc}")
+
+    return None, (
+        "PyMuPDF is not available or is conflicted. In requirements.txt, include `PyMuPDF` "
+        "and do not include `fitz`. Then commit and reboot Streamlit. Details: "
+        + " | ".join(import_errors)
+    )
 
 
 def require_pymupdf() -> Any:
@@ -302,16 +339,38 @@ def require_pymupdf() -> Any:
     return pymupdf
 
 
-def render_pdf_pages_uncached(pdf_bytes: bytes, zoom: float = 2.0) -> List[Image.Image]:
+def render_pdf_pages_uncached(pdf_bytes: bytes, zoom: float = 1.5, max_pages: int = 50) -> List[Image.Image]:
+    """Render PDF pages to images.
+
+    Lower zoom keeps large construction drawings from exhausting Streamlit Cloud memory.
+    max_pages prevents one massive drawing set from crashing the prototype.
+    """
     if not pdf_bytes:
-        raise ValueError("No PDF bytes were provided.")
+        raise ValueError("No PDF bytes were provided. Try uploading the PDF again.")
 
     fitz = require_pymupdf()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        raise ValueError(
+            "This file could not be opened as a PDF. Make sure it is a valid, uncorrupted PDF file. "
+            f"Details: {exc}"
+        ) from exc
+
     images: List[Image.Image] = []
 
     try:
-        for page in doc:
+        if getattr(doc, "needs_pass", False):
+            raise ValueError("This PDF is password-protected. Please upload an unlocked copy.")
+
+        page_count = len(doc)
+        if page_count == 0:
+            raise ValueError("This PDF does not contain any pages.")
+
+        pages_to_render = min(page_count, max_pages)
+        for page_index in range(pages_to_render):
+            page = doc[page_index]
             matrix = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=matrix, alpha=False)
             img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
@@ -324,10 +383,10 @@ def render_pdf_pages_uncached(pdf_bytes: bytes, zoom: float = 2.0) -> List[Image
 
 if st is not None:
     @st.cache_data(show_spinner=False)
-    def render_pdf_pages(pdf_bytes: bytes, zoom: float = 2.0) -> List[Image.Image]:
+    def render_pdf_pages(pdf_bytes: bytes, zoom: float = 1.5) -> List[Image.Image]:
         return render_pdf_pages_uncached(pdf_bytes, zoom)
 else:
-    def render_pdf_pages(pdf_bytes: bytes, zoom: float = 2.0) -> List[Image.Image]:
+    def render_pdf_pages(pdf_bytes: bytes, zoom: float = 1.5) -> List[Image.Image]:
         return render_pdf_pages_uncached(pdf_bytes, zoom)
 
 
@@ -572,6 +631,10 @@ class TraceTakeoffTests(unittest.TestCase):
         self.assertEqual(instruction.suggested_unit, "EA")
         self.assertEqual(instruction.suggested_measurement_type, "count")
 
+    def test_canvas_compatibility_patch_does_not_crash(self) -> None:
+        warning = patch_streamlit_drawable_canvas_image_helper()
+        self.assertTrue(warning is None or isinstance(warning
+
 
 def run_tests() -> None:
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(TraceTakeoffTests)
@@ -590,6 +653,10 @@ def render_dependency_panel() -> bool:
     if st is None:
         print("Streamlit is not installed. Run: pip install streamlit")
         return False
+
+    canvas_patch_warning = patch_streamlit_drawable_canvas_image_helper()
+    if canvas_patch_warning:
+        st.warning(canvas_patch_warning)
 
     missing: List[str] = []
     if st_canvas is None:
@@ -777,7 +844,8 @@ def run_app() -> None:
             st.info("Upload a PDF drawing set in the sidebar to begin.")
             return
 
-        pdf_bytes = uploaded_pdf.read()
+        pdf_bytes = uploaded_pdf.getvalue()
+        st.caption(f"Uploaded file: {uploaded_pdf.name} • {len(pdf_bytes) / (1024 * 1024):.2f} MB")
 
         try:
             pages = render_pdf_pages(pdf_bytes)
@@ -915,4 +983,5 @@ if __name__ == "__main__":
         run_tests()
     else:
         run_app()
+
 
