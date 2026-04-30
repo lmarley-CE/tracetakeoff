@@ -117,6 +117,23 @@ class TakeoffRow:
 
 
 @dataclass
+class MarkedSegment:
+    """A measured redline segment saved for final PDF export.
+
+    Coordinates are stored in original PDF page coordinate space, not screen space.
+    This makes the final marked-up PDF accurate even if the on-screen preview was resized.
+    """
+    page_index: int
+    page_number: int
+    product_name: str
+    drawing_name: str
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
+@dataclass
 class EstimatorInstruction:
     raw_instruction: str
     suggested_product_name: str
@@ -387,13 +404,16 @@ else:
         return render_pdf_pages_uncached(pdf_bytes, zoom)
 
 
-def export_marked_pdf(
+def canvas_segments_to_pdf_segments(
     pdf_bytes: bytes,
     page_index: int,
     line_segments: List[Dict[str, float]],
     image_width: int,
     image_height: int,
-) -> bytes:
+    product_name: str,
+    drawing_name: str,
+) -> List[MarkedSegment]:
+    """Convert on-screen canvas coordinates into original PDF page coordinates."""
     if image_width <= 0 or image_height <= 0:
         raise ValueError("Image width and height must be greater than zero.")
 
@@ -409,17 +429,77 @@ def export_marked_pdf(
         scale_x = page_rect.width / image_width
         scale_y = page_rect.height / image_height
 
+        marked_segments: List[MarkedSegment] = []
         for seg in line_segments:
-            x1 = float(seg["x1"]) * scale_x
-            y1 = float(seg["y1"]) * scale_y
-            x2 = float(seg["x2"]) * scale_x
-            y2 = float(seg["y2"]) * scale_y
+            marked_segments.append(
+                MarkedSegment(
+                    page_index=page_index,
+                    page_number=page_index + 1,
+                    product_name=product_name,
+                    drawing_name=drawing_name,
+                    x1=float(seg["x1"]) * scale_x,
+                    y1=float(seg["y1"]) * scale_y,
+                    x2=float(seg["x2"]) * scale_x,
+                    y2=float(seg["y2"]) * scale_y,
+                )
+            )
+        return marked_segments
+    finally:
+        doc.close()
 
-            shape = page.new_shape()
-            shape.draw_line(fitz.Point(x1, y1), fitz.Point(x2, y2))
-            shape.finish(color=(1, 0, 0), width=2)
-            shape.commit()
 
+def draw_marked_segments_on_doc(doc: Any, marked_segments: List[MarkedSegment], line_width: float = 2.5) -> None:
+    """Draw saved redline segments onto a PyMuPDF document in-place."""
+    fitz = require_pymupdf()
+
+    for seg in marked_segments:
+        if seg.page_index < 0 or seg.page_index >= len(doc):
+            continue
+
+        page = doc[seg.page_index]
+        shape = page.new_shape()
+        shape.draw_line(fitz.Point(seg.x1, seg.y1), fitz.Point(seg.x2, seg.y2))
+        shape.finish(color=(1, 0, 0), width=line_width)
+        shape.commit()
+
+
+def export_marked_pdf(
+    pdf_bytes: bytes,
+    page_index: int,
+    line_segments: List[Dict[str, float]],
+    image_width: int,
+    image_height: int,
+) -> bytes:
+    """Export a one-page/current-view redline PDF preview."""
+    marked_segments = canvas_segments_to_pdf_segments(
+        pdf_bytes=pdf_bytes,
+        page_index=page_index,
+        line_segments=line_segments,
+        image_width=image_width,
+        image_height=image_height,
+        product_name="Current takeoff",
+        drawing_name=f"Page {page_index + 1}",
+    )
+
+    fitz = require_pymupdf()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    try:
+        draw_marked_segments_on_doc(doc, marked_segments)
+        output = io.BytesIO()
+        doc.save(output)
+        return output.getvalue()
+    finally:
+        doc.close()
+
+
+def export_final_marked_pdf(pdf_bytes: bytes, marked_segments: List[MarkedSegment]) -> bytes:
+    """Export the original full PDF with every saved measured segment traced in red."""
+    fitz = require_pymupdf()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    try:
+        draw_marked_segments_on_doc(doc, marked_segments, line_width=2.5)
         output = io.BytesIO()
         doc.save(output)
         return output.getvalue()
@@ -704,6 +784,15 @@ def initialize_state() -> None:
     if "assistant_notes" not in st.session_state:
         st.session_state.assistant_notes = "Manual trace from prototype review."
 
+    if "marked_segments" not in st.session_state:
+        st.session_state.marked_segments = []
+
+    if "active_pdf_bytes" not in st.session_state:
+        st.session_state.active_pdf_bytes = None
+
+    if "active_pdf_name" not in st.session_state:
+        st.session_state.active_pdf_name = "uploaded_drawings.pdf"
+
 
 def get_current_defaults() -> Dict[str, Any]:
     defaults = {
@@ -842,6 +931,8 @@ def run_app() -> None:
             return
 
         pdf_bytes = uploaded_pdf.getvalue()
+        st.session_state.active_pdf_bytes = pdf_bytes
+        st.session_state.active_pdf_name = uploaded_pdf.name
         st.caption(f"Uploaded file: {uploaded_pdf.name} • {len(pdf_bytes) / (1024 * 1024):.2f} MB")
 
         try:
@@ -928,7 +1019,21 @@ def run_app() -> None:
                 notes=notes,
             )
             st.session_state.takeoff_rows.append(row)
-            st.success("Added to takeoff summary.")
+
+            saved_segments = canvas_segments_to_pdf_segments(
+                pdf_bytes=pdf_bytes,
+                page_index=page_number - 1,
+                line_segments=line_segments,
+                image_width=display_width,
+                image_height=display_height,
+                product_name=active_rule.product_name,
+                drawing_name=drawing_name,
+            )
+            st.session_state.marked_segments.extend(saved_segments)
+
+            st.success(
+                f"Added to takeoff summary and saved {len(saved_segments)} redline segment(s) for final marked PDF export."
+            )
 
         if line_segments:
             try:
@@ -969,6 +1074,28 @@ def run_app() -> None:
                 file_name="takeoff_summary.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
+            st.divider()
+            st.subheader("Estimator Review PDF")
+            st.write(
+                "Download the original drawing set with every saved measured portion traced in red. "
+                "This is the visual back-check file for the estimator."
+            )
+            st.metric("Saved redline segments", len(st.session_state.marked_segments))
+
+            if st.session_state.active_pdf_bytes and st.session_state.marked_segments:
+                final_marked_pdf = export_final_marked_pdf(
+                    st.session_state.active_pdf_bytes,
+                    st.session_state.marked_segments,
+                )
+                st.download_button(
+                    label="Download Final Marked-Up Drawing PDF",
+                    data=final_marked_pdf,
+                    file_name="final_marked_takeoff_drawings.pdf",
+                    mime="application/pdf",
+                )
+            else:
+                st.info("Add at least one traced page to the summary before exporting the final marked-up drawing PDF.")
         else:
             st.info("No takeoff rows yet. Trace a page and add it to the summary.")
 
@@ -980,6 +1107,7 @@ if __name__ == "__main__":
         run_tests()
     else:
         run_app()
+
 
 
 
