@@ -1,6 +1,6 @@
-streamlit
+streamlit==1.40.2
+streamlit-drawable-canvas==0.9.3
 PyMuPDF
 pandas
 openpyxl
 pillow
-streamlit-drawable-canvas
